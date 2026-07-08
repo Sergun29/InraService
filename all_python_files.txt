@@ -1,0 +1,856 @@
+================================================================================
+Имя файла: check_db.py
+Путь: C:\PJ\InraService\app\check_db.py
+================================================================================
+
+import asyncio
+import asyncpg
+
+async def main():
+    conn = await asyncpg.connect("postgresql://intraservice_user:123!@10.47.4.173:5432/intraservice_db")
+    rows = await conn.fetch("SELECT * FROM task_dialogs ORDER BY id DESC LIMIT 10;")
+    for row in rows:
+        print(dict(row))
+    await conn.close()
+
+asyncio.run(main())
+
+================================================================================
+Имя файла: check_task_status.py
+Путь: C:\PJ\InraService\app\check_task_status.py
+================================================================================
+
+import os
+import sys
+import asyncio
+import json
+import httpx
+
+BASE_URL = os.getenv("INTRASERVICE_BASE_URL", "https://ap1711.intraservice.ru/api").rstrip("/")
+LOGIN = os.getenv("INTRASERVICE_LOGIN")
+PASSWORD = os.getenv("INTRASERVICE_PASSWORD")
+TASK_ID = int(sys.argv[1]) if len(sys.argv) > 1 else 126072
+
+
+async def main():
+    if not LOGIN or not PASSWORD:
+        raise SystemExit(
+            "Нужно задать переменные окружения INTRASERVICE_LOGIN и INTRASERVICE_PASSWORD"
+        )
+
+    if not BASE_URL.endswith("/api"):
+        api_base = f"{BASE_URL}/api"
+    else:
+        api_base = BASE_URL
+
+    url = f"{api_base}/task/{TASK_ID}"
+
+    async with httpx.AsyncClient(
+        auth=(LOGIN, PASSWORD),
+        timeout=20.0,
+        follow_redirects=True,
+        headers={"Accept": "application/json"},
+    ) as client:
+        resp = await client.get(url)
+        print("REQUEST URL:", resp.request.url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+Имя файла: clean_db.py
+Путь: C:\PJ\InraService\app\clean_db.py
+================================================================================
+
+import asyncio
+import asyncpg
+
+from app.config import settings
+
+
+async def main():
+    conn = await asyncpg.connect(settings.DATABASE_URL)
+
+    try:
+        deleted = await conn.execute("DELETE FROM task_dialogs;")
+        await conn.execute("ALTER SEQUENCE task_dialogs_id_seq RESTART WITH 1;")
+        print(f"[clean_db] done: {deleted}")
+        print("[clean_db] sequence task_dialogs_id_seq restarted to 1")
+    finally:
+        await conn.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+Имя файла: config.py
+Путь: C:\PJ\InraService\app\config.py
+================================================================================
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class Settings:
+    INTRASERVICE_BASE_URL = (
+        os.getenv("INTRASERVICE_BASE_URL", "http://ap1711.intraservice.ru")
+        .replace("https://", "http://")
+        .rstrip("/")
+    )
+    INTRASERVICE_LOGIN = os.getenv("INTRASERVICE_LOGIN")
+    INTRASERVICE_PASSWORD = os.getenv("INTRASERVICE_PASSWORD")
+
+    INTRASERVICE_EXECUTOR_IDS = os.getenv("INTRASERVICE_EXECUTOR_IDS", "927,945,1638,1664")
+    INTRASERVICE_CREATOR_ID = int(os.getenv("INTRASERVICE_CREATOR_ID", "1664"))
+
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://intraservice_user:123!@10.47.4.173:5432/intraservice_db")
+
+    POLLER_INTERVAL_SECONDS = int(os.getenv("POLLER_INTERVAL_SECONDS", 15))
+
+
+settings = Settings()
+
+================================================================================
+Имя файла: db.py
+Путь: C:\PJ\InraService\app\db.py
+================================================================================
+
+import json
+import asyncpg
+from app.config import settings
+
+_pool: asyncpg.Pool | None = None
+
+
+async def init_db() -> None:
+    global _pool
+    _pool = await asyncpg.create_pool(dsn=settings.DATABASE_URL, min_size=1, max_size=5, ssl=False)
+
+    async with _pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS task_dialogs (
+                id SERIAL PRIMARY KEY,
+                task_id BIGINT UNIQUE NOT NULL,
+                original_text TEXT,
+                dialog_history JSONB,
+                iteration_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'new',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+    print("[db] PostgreSQL pool initialized, table task_dialogs ready")
+
+
+async def close_db() -> None:
+    global _pool
+    if _pool:
+        await _pool.close()
+
+
+async def get_dialog(task_id: int) -> dict | None:
+    async with _pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM task_dialogs WHERE task_id = $1", task_id)
+        return dict(row) if row else None
+
+
+async def create_dialog(task_id: int, original_text: str, history: list, status: str = "new") -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO task_dialogs (task_id, original_text, dialog_history, iteration_count, status)
+            VALUES ($1, $2, $3, 0, $4)
+            """,
+            task_id, original_text, json.dumps(history, ensure_ascii=False), status,
+        )
+
+
+async def update_dialog(task_id: int, history: list, iteration_count: int, status: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE task_dialogs
+            SET dialog_history = $1, iteration_count = $2, status = $3, updated_at = NOW()
+            WHERE task_id = $4
+            """,
+            json.dumps(history, ensure_ascii=False), iteration_count, status, task_id,
+        )
+
+================================================================================
+Имя файла: debug_routes.py
+Путь: C:\PJ\InraService\app\debug_routes.py
+================================================================================
+
+from fastapi import APIRouter
+from app.intraservice_client import intraservice_client
+from app.config import settings
+
+router = APIRouter()
+
+
+@router.post("/debug/send-comment/{task_id}")
+async def debug_send_comment(task_id: int, comment: str = "Тестовый комментарий от нейросети"):
+    task = await intraservice_client.get_task_by_id(task_id)
+    if not task:
+        return {"error": "task not found"}
+
+    status, text = await intraservice_client.post_task_update(
+        task=task,
+        comment=comment,
+        creator_id=settings.INTRASERVICE_CREATOR_ID,
+    )
+    return {"status_code": status, "response_body": text[:1000], "task_snapshot": task}
+
+
+@router.get("/debug/task-comments/{task_id}")
+async def debug_task_comments(task_id: int):
+    expenses = await intraservice_client.get_task_expenses_with_comments(task_id)
+
+    comments_only = [
+        {
+            "Id": e.get("Id"),
+            "UserName": e.get("UserName"),
+            "Date": e.get("Date"),
+            "EditorName": e.get("EditorName"),
+            "Comments": e.get("Comments"),
+        }
+        for e in expenses
+    ]
+
+    has_comments = any((c.get("Comments") or "").strip() for c in comments_only)
+
+    return {
+        "task_id": task_id,
+        "raw_expenses_count": len(expenses),
+        "comments": comments_only,
+        "has_comments": has_comments,
+    }
+
+================================================================================
+Имя файла: dialog_service.py
+Путь: C:\PJ\InraService\app\dialog_service.py
+================================================================================
+
+from app.db import get_dialog, create_dialog, update_dialog
+from app.intraservice_client import intraservice_client
+from app.llm_client import ask_llm_for_clarification, ask_llm_continue
+from app.config import settings
+import json
+
+
+async def process_task_dialog(task_id: int, task_data: dict) -> None:
+    record = await get_dialog(task_id)
+
+    if not record:
+        # Новая задача — проверяем, что она "чистая", без чужих комментариев
+        comments = await intraservice_client.get_task_expenses_with_comments(task_id)
+        has_comments = any((c.get("Comments") or "").strip() for c in comments)
+
+        if has_comments:
+            print(f"[dialog_service] task {task_id}: skip, already has comments")
+            return
+
+        description = task_data.get("Description") or task_data.get("Name") or ""
+        question = await ask_llm_for_clarification(description)
+
+        history = [{"role": "assistant", "content": question}]
+        await create_dialog(task_id, description, history)
+
+        await intraservice_client.post_task_update(
+            task=task_data,
+            comment=question,
+            creator_id=settings.INTRASERVICE_CREATOR_ID,
+            is_private_comment=False,
+        )
+        return
+
+    history = record["dialog_history"]
+    if isinstance(history, str):
+        history = json.loads(history)
+
+    last_comment = task_data.get("LastComment") or ""
+    if last_comment:
+        history.append({"role": "user", "content": last_comment})
+
+    new_response = await ask_llm_continue(history)
+    history.append({"role": "assistant", "content": new_response})
+
+    new_count = record["iteration_count"] + 1
+    status = "completed" if new_count >= settings.MAX_ITERATIONS else "awaiting_response"
+
+    await update_dialog(task_id, history, new_count, status)
+
+    await intraservice_client.post_task_update(
+        task=task_data,
+        comment=new_response,
+        creator_id=settings.INTRASERVICE_CREATOR_ID,
+        is_private_comment=False,
+    )
+
+================================================================================
+Имя файла: intraservice_client.py
+Путь: C:\PJ\InraService\app\intraservice_client.py
+================================================================================
+
+import httpx
+from base64 import b64encode
+
+from app.config import settings
+
+
+class IntraServiceClient:
+    def __init__(self, base_url: str, username: str, password: str, timeout: int = 30):
+        self.base_url = base_url.rstrip("/") + "/api"
+        self.timeout = timeout
+
+        auth_str = f"{username}:{password}"
+        auth_b64 = b64encode(auth_str.encode()).decode()
+        self.headers = {
+            "Authorization": f"Basic {auth_b64}",
+            "Accept": "application/json",
+        }
+
+    async def get_tasks(
+        self,
+        changed_more_than: str | None = None,
+        executor_ids: str | None = None,
+        service_name: str | None = "",
+        executor_group: str | None = "",
+        page: int = 1,
+        page_size: int = 100,
+    ) -> list[dict]:
+        """
+        Повторяет фильтры из рабочих скриптов:
+        INTRA_PARAMS = {"ExecutorGroup": "", "ServiceName": "", "ExecutorIds": "1664,1638,927,945"}
+        Без этих параметров API у данного инстанса возвращает пустой список.
+        """
+        url = f"{self.base_url}/task"
+
+        params = {
+            "fields": (
+                "Id,Name,Description,Changed,Created,Closed,"
+                "CreatorId,Creator,StatusId,ServiceId,"
+                "ExecutorIds,Executors,ExecutorGroupId,ExecutorGroup,"
+                "CategoryIds,ObserverIds,CoordinatorIds,TypeId,PriorityId"
+            ),
+            "page": page,
+            "pagesize": page_size,
+        }
+        params["StatusIds"] = "27,31,35"
+        if executor_group is not None:
+            params["ExecutorGroup"] = executor_group
+        if service_name is not None:
+            params["ServiceName"] = service_name
+        if executor_ids:
+            params["ExecutorIds"] = executor_ids
+        if changed_more_than:
+            params["ChangedMoreThan"] = changed_more_than
+
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers=self.headers, params=params)
+            print("[intraservice_client] GET TASKS URL:", str(resp.request.url))
+            resp.raise_for_status()
+            data = resp.json()
+
+        print("[intraservice_client] RAW TASKS RESPONSE:", data)
+
+        if isinstance(data, dict) and isinstance(data.get("Tasks"), list):
+            return data["Tasks"]
+        return []
+
+    async def get_task_by_id(self, task_id: int) -> dict | None:
+        """
+        Одна задача возвращается под ключом "Task" (не "Tasks"),
+        как показано в рабочем скрипте fetch_task().
+        """
+        url = f"{self.base_url}/task/{task_id}"
+
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers=self.headers)
+            print("[intraservice_client] GET TASK URL:", str(resp.request.url))
+            if resp.status_code != 200:
+                print("[intraservice_client] GET TASK FAILED:", resp.status_code, resp.text[:500])
+                return None
+            data = resp.json() or {}
+
+        return data.get("Task")
+
+    async def get_task_expenses_with_comments(self, task_id: int) -> list[dict]:
+        url = f"{self.base_url}/task/expenses"
+        params = {
+            "taskid": task_id,
+            "fields": "Id,UserName,Date,Comments,TaskId,EditorName",
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            resp = await client.get(url, headers=self.headers, params=params)
+            print("[intraservice_client] EXPENSES URL:", str(resp.request.url))
+            if resp.status_code != 200:
+                print("[intraservice_client] EXPENSES FAILED:", resp.status_code, resp.text[:500])
+                return []
+            data = resp.json()
+
+        if isinstance(data, dict) and isinstance(data.get("Expenses"), list):
+            return data["Expenses"]
+        return []
+
+    async def post_task_update(
+        self,
+        task: dict,
+        comment: str | None = None,
+        status_id: int | None = None,
+        creator_id: int | None = None,
+        is_private_comment: bool = False,
+    ) -> tuple[int, str]:
+        task_id = int(task.get("Id"))
+        url = f"{self.base_url}/task/{task_id}"
+
+        payload = {
+            "Id": task_id,
+            "Name": task.get("Name") or "",
+            "ServiceId": task.get("ServiceId"),
+            "StatusId": int(status_id) if status_id is not None else task.get("StatusId"),
+            "PriorityId": task.get("PriorityId"),
+            "TypeId": task.get("TypeId"),
+            "CreatorId": creator_id or settings.INTRASERVICE_CREATOR_ID,
+            "IsPrivateComment": is_private_comment,
+        }
+
+        for k in ["ExecutorIds", "ObserverIds", "CoordinatorIds", "ServiceStageId"]:
+            v = task.get(k)
+            if v is not None and v != "":
+                payload[k] = v
+
+        if comment:
+            payload["Comment"] = comment
+
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+            resp = await client.post(url, headers=self.headers, json=payload)
+            print("[intraservice_client] POST TASK URL:", str(resp.request.url))
+            print("[intraservice_client] POST TASK PAYLOAD:", payload)
+            print("[intraservice_client] POST TASK STATUS:", resp.status_code)
+            print("[intraservice_client] POST TASK BODY:", resp.text[:2000])
+
+        return resp.status_code, resp.text
+
+
+if not settings.INTRASERVICE_BASE_URL:
+    raise ValueError("INTRASERVICE_BASE_URL is not set")
+if not settings.INTRASERVICE_LOGIN:
+    raise ValueError("INTRASERVICE_LOGIN is not set")
+if not settings.INTRASERVICE_PASSWORD:
+    raise ValueError("INTRASERVICE_PASSWORD is not set")
+
+
+intraservice_client = IntraServiceClient(
+    base_url=settings.INTRASERVICE_BASE_URL,
+    username=settings.INTRASERVICE_LOGIN,
+    password=settings.INTRASERVICE_PASSWORD,
+)
+
+================================================================================
+Имя файла: llm_client.py
+Путь: C:\PJ\InraService\app\llm_client.py
+================================================================================
+
+import httpx
+
+from app.config import settings
+
+
+async def ask_llm_for_clarification(task_description: str) -> str:
+    prompt = (
+        "Ты помогаешь уточнять формулировки задач в service desk. "
+        "Прочитай описание задачи и задай ОДИН короткий уточняющий вопрос постановщику, "
+        "если формулировка неполная или неясная. Если всё понятно — предложи улучшенную формулировку.\n\n"
+        f"Описание задачи:\n{task_description}"
+    )
+    return await _call_llm([{"role": "user", "content": prompt}])
+
+
+async def ask_llm_continue(history: list[dict]) -> str:
+    return await _call_llm(history)
+
+
+async def _call_llm(messages: list[dict]) -> str:
+    url = f"{settings.LLM_API_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.LLM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": messages,
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    return data["choices"][0]["message"]["content"]
+
+================================================================================
+Имя файла: main.py
+Путь: C:\PJ\InraService\app\main.py
+================================================================================
+
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, HTTPException
+
+from app.db import init_db, close_db
+from app.poller import poll_intraservice_forever
+from app.intraservice_client import intraservice_client
+from app.task_ingestion import ingest_task
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    task = asyncio.create_task(poll_intraservice_forever())
+    yield
+    task.cancel()
+    await close_db()
+
+
+app = FastAPI(title="IntraService Task Corrector", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
+@app.get("/debug/task/{task_id}")
+async def debug_task(task_id: int):
+    task = await intraservice_client.get_task_by_id(task_id)
+    if task is None:
+        return {"error": "task not found or empty response"}
+    return task
+
+
+@app.post("/webhook/new-task")
+async def new_task_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    task_id = body.get("Id")
+    if not task_id:
+        raise HTTPException(status_code=422, detail="Missing task Id")
+
+    await ingest_task(body)
+    return {"status": "ok", "task_id": task_id}
+
+================================================================================
+Имя файла: main_true.py
+Путь: C:\PJ\InraService\app\main_true.py
+================================================================================
+
+
+import asyncio
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, HTTPException
+
+from app.db import init_db, close_db
+from app.poller import poll_intraservice_forever
+from app.intraservice_client import intraservice_client
+from app.dialog_service import process_task_dialog
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    task = asyncio.create_task(poll_intraservice_forever())
+    yield
+    task.cancel()
+    await close_db()
+
+
+app = FastAPI(title="IntraService Task Corrector", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+
+@app.get("/debug/task/{task_id}")
+async def debug_task(task_id: int):
+    task = await intraservice_client.get_task_by_id(task_id)
+    if task is None:
+        return {"error": "task not found or empty response"}
+    return task
+
+
+@app.get("/debug/tasks")
+async def debug_tasks(page: int = 1, page_size: int = 50):
+    tasks = await intraservice_client.get_tasks(page=page, page_size=page_size)
+    return {"count": len(tasks), "tasks": tasks}
+
+
+@app.post("/webhook/new-task")
+async def new_task_webhook(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    task_id = body.get("Id")
+    if not task_id:
+        raise HTTPException(status_code=422, detail="Missing task Id")
+
+    await process_task_dialog(task_id, body)
+    return {"status": "ok", "task_id": task_id}
+
+
+================================================================================
+Имя файла: poller.py
+Путь: C:\PJ\InraService\app\poller.py
+================================================================================
+
+import asyncio
+
+from app.intraservice_client import intraservice_client
+from app.task_ingestion import ingest_task
+from app.config import settings
+
+PAGE_SIZE = 50
+
+
+async def poll_intraservice_once() -> None:
+    page = 1
+
+    while True:
+        tasks = await intraservice_client.get_tasks(
+            changed_more_than=None,
+            executor_ids=settings.INTRASERVICE_EXECUTOR_IDS,
+            service_name="",
+            executor_group="",
+            page=page,
+            page_size=PAGE_SIZE,
+        )
+
+        if not tasks:
+            print(f"[poller] page={page}: no tasks")
+            break
+
+        print(f"[poller] page={page}: received {len(tasks)} tasks")
+
+        for task in tasks:
+            if task.get("Closed"):
+                continue
+            try:
+                await ingest_task(task)
+            except Exception as e:
+                print(f"[poller] error processing task {task.get('Id')}: {e}")
+
+        if len(tasks) < PAGE_SIZE:
+            break
+        page += 1
+
+
+async def poll_intraservice_forever() -> None:
+    if settings.POLLER_INTERVAL_SECONDS == 0:
+        print("[poller] POLLER_INTERVAL_SECONDS=0, running once and stopping")
+        try:
+            await poll_intraservice_once()
+        except Exception as e:
+            print(f"[poller] error: {e}")
+        print("[poller] single run finished")
+        return
+
+    print("[poller] start (recurring mode)")
+    while True:
+        try:
+            await poll_intraservice_once()
+        except Exception as e:
+            print(f"[poller] error: {e}")
+        await asyncio.sleep(settings.POLLER_INTERVAL_SECONDS)
+
+================================================================================
+Имя файла: poller1.py
+Путь: C:\PJ\InraService\app\poller1.py
+================================================================================
+
+import asyncio
+
+from app.intraservice_client import intraservice_client
+from app.dialog_service import process_task_dialog
+from app.config import settings
+
+DEBUG_TASK_ID = 125713
+
+
+async def poll_single_task_once() -> None:
+    task = await intraservice_client.get_task_by_id(DEBUG_TASK_ID)
+
+    if not task:
+        print(f"[poller1] task {DEBUG_TASK_ID} not found")
+        return
+
+    print(f"[poller1] processing only task {DEBUG_TASK_ID}")
+    try:
+        await process_task_dialog(DEBUG_TASK_ID, task)
+    except Exception as e:
+        print(f"[poller1] error processing task {DEBUG_TASK_ID}: {e}")
+
+
+async def poll_single_task_forever() -> None:
+    print(f"[poller1] start, watching only task {DEBUG_TASK_ID}")
+    while True:
+        try:
+            await poll_single_task_once()
+        except Exception as e:
+            print(f"[poller1] error: {e}")
+        await asyncio.sleep(settings.POLLER_INTERVAL_SECONDS)
+
+
+if __name__ == "__main__":
+    asyncio.run(poll_single_task_forever())
+
+================================================================================
+Имя файла: task_ingestion.py
+Путь: C:\PJ\InraService\app\task_ingestion.py
+================================================================================
+
+from datetime import datetime, date
+
+from app.db import get_dialog, create_dialog
+from app.intraservice_client import intraservice_client
+
+
+def _parse_created(created_str: str | None) -> date | None:
+    if not created_str:
+        return None
+    try:
+        return datetime.fromisoformat(created_str).date()
+    except ValueError:
+        return None
+
+
+async def has_comments(task_id: int) -> bool:
+    expenses = await intraservice_client.get_task_expenses_with_comments(task_id)
+    return any((e.get("Comments") or "").strip() for e in expenses)
+
+
+async def ingest_task(task: dict) -> None:
+    task_id = task.get("Id")
+    if not task_id:
+        return
+
+    existing = await get_dialog(task_id)
+    if existing:
+        return
+
+    created_date = _parse_created(task.get("Created"))
+    if created_date != date.today():
+        return
+
+    if await has_comments(task_id):
+        print(f"[ingestion] task {task_id}: skip, already has comments")
+        return
+
+    description = task.get("Description") or task.get("Name") or ""
+    await create_dialog(task_id, description, history=[], status="new")
+    print(f"[ingestion] task {task_id}: saved to DB, status=new")
+
+================================================================================
+Имя файла: test_send.py
+Путь: C:\PJ\InraService\app\test_send.py
+================================================================================
+
+import asyncio
+
+from app.intraservice_client import intraservice_client
+from app.llm_client import ask_llm_for_clarification
+from app.config import settings
+
+TASK_ID = 125713
+
+
+async def main():
+    task = await intraservice_client.get_task_by_id(TASK_ID)
+    if not task:
+        print(f"Задача {TASK_ID} не найдена")
+        return
+
+    print("Задача получена:", task.get("Id"), task.get("Name"))
+
+    description = task.get("Description") or task.get("Name") or ""
+    question = await ask_llm_for_clarification(description)
+    print("Вопрос от нейросети:", question)
+
+    status, text = await intraservice_client.post_task_update(
+        task=task,
+        comment=question,
+        creator_id=settings.INTRASERVICE_CREATOR_ID,
+    )
+
+    print("=" * 60)
+    print("STATUS:", status)
+    print("BODY (первые 2000 симв.):")
+    print(text[:2000])
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+Имя файла: test_simple.py
+Путь: C:\PJ\InraService\app\test_simple.py
+================================================================================
+
+import asyncio
+
+from app.intraservice_client import intraservice_client
+from app.llm_client import ask_llm_for_clarification
+
+TASK_ID = 125713
+
+
+async def main():
+    task = await intraservice_client.get_task_by_id(TASK_ID)
+
+    if not task:
+        print(f"Задача {TASK_ID} не найдена")
+        return
+
+    print("=" * 60)
+    print("ЗАДАЧА:")
+    print("Id:", task.get("Id"))
+    print("Name:", task.get("Name"))
+    print("Description:", task.get("Description"))
+    print("=" * 60)
+
+    description = task.get("Description") or task.get("Name") or ""
+    question = await ask_llm_for_clarification(description)
+
+    print("ОТВЕТ НЕЙРОСЕТИ:")
+    print(question)
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+================================================================================
+Имя файла: __init__.py
+Путь: C:\PJ\InraService\app\__init__.py
+================================================================================
+
+
+
