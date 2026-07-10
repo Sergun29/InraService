@@ -1,7 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 
 from app.db import init_db, close_db
 from app.poller import poll_intraservice_forever
@@ -39,11 +39,15 @@ async def new_task_webhook(request: Request):
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        # Возвращаем 200 OK, чтобы ИнтраСервис не спамил повторами
+        return {"status": "ignored", "detail": "Empty or invalid body"}
+
+    if not isinstance(body, dict):
+         return {"status": "ignored", "detail": "Body is not a dictionary"}
 
     task_id = body.get("Id")
     if not task_id:
-        raise HTTPException(status_code=422, detail="Missing task Id")
+        return {"status": "ignored", "detail": "Missing task Id"}
 
     await ingest_task(body)
     return {"status": "ok", "task_id": task_id}
