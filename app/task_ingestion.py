@@ -29,5 +29,5 @@ async def ingest_task(task: dict) -> None:
         return
 
     description = task.get("Description") or task.get("Name") or ""
-    await create_dialog(task_id, description, history=[], status="new")
-    print(f"[ingestion] task {task_id}: saved to DB, status=new")
+    await create_dialog(task_id, description, history=[], status="ready_for_ai")
+    print(f"[ingestion] task {task_id}: saved to DB, status=ready_for_ai")

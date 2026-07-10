@@ -5,6 +5,7 @@ from fastapi import FastAPI, Request
 
 from app.db import init_db, close_db
 from app.poller import poll_intraservice_forever
+from app.processor import process_dialogs_forever
 from app.intraservice_client import intraservice_client
 from app.task_ingestion import ingest_task
 
@@ -12,9 +13,11 @@ from app.task_ingestion import ingest_task
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
-    task = asyncio.create_task(poll_intraservice_forever())
+    poller_task = asyncio.create_task(poll_intraservice_forever())
+    processor_task = asyncio.create_task(process_dialogs_forever())
     yield
-    task.cancel()
+    poller_task.cancel()
+    processor_task.cancel()
     await close_db()
 
 
@@ -39,11 +42,10 @@ async def new_task_webhook(request: Request):
     try:
         body = await request.json()
     except Exception:
-        # Возвращаем 200 OK, чтобы ИнтраСервис не спамил повторами
         return {"status": "ignored", "detail": "Empty or invalid body"}
 
     if not isinstance(body, dict):
-         return {"status": "ignored", "detail": "Body is not a dictionary"}
+        return {"status": "ignored", "detail": "Body is not a dictionary"}
 
     task_id = body.get("Id")
     if not task_id:

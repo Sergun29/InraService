@@ -26,9 +26,24 @@ async def init_db() -> None:
                 dialog_history JSONB,
                 iteration_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'new',
+                last_processed_comment TEXT,
+                last_processed_comment_at TEXT,
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
+            """
+        )
+
+        await conn.execute(
+            """
+            ALTER TABLE task_dialogs
+            ADD COLUMN IF NOT EXISTS last_processed_comment TEXT
+            """
+        )
+        await conn.execute(
+            """
+            ALTER TABLE task_dialogs
+            ADD COLUMN IF NOT EXISTS last_processed_comment_at TEXT
             """
         )
 
@@ -50,12 +65,35 @@ async def get_dialog(task_id: int) -> dict | None:
         return dict(row) if row else None
 
 
+async def get_dialogs_for_ai(limit: int = 50) -> list[dict]:
+    async with _pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT *
+            FROM task_dialogs
+            WHERE status IN ('new', 'ready_for_ai', 'awaiting_user_response')
+            ORDER BY updated_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+
 async def create_dialog(task_id: int, original_text: str, history: list, status: str = "new") -> None:
     async with _pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO task_dialogs (task_id, original_text, dialog_history, iteration_count, status)
-            VALUES ($1, $2, $3, 0, $4)
+            INSERT INTO task_dialogs (
+                task_id,
+                original_text,
+                dialog_history,
+                iteration_count,
+                status,
+                last_processed_comment,
+                last_processed_comment_at
+            )
+            VALUES ($1, $2, $3, 0, $4, NULL, NULL)
             """,
             task_id,
             original_text,
@@ -64,16 +102,43 @@ async def create_dialog(task_id: int, original_text: str, history: list, status:
         )
 
 
-async def update_dialog(task_id: int, history: list, iteration_count: int, status: str) -> None:
+async def update_dialog(
+    task_id: int,
+    history: list,
+    iteration_count: int,
+    status: str,
+    last_processed_comment: str | None = None,
+    last_processed_comment_at: str | None = None,
+) -> None:
     async with _pool.acquire() as conn:
         await conn.execute(
             """
             UPDATE task_dialogs
-            SET dialog_history = $1, iteration_count = $2, status = $3, updated_at = NOW()
-            WHERE task_id = $4
+            SET dialog_history = $1,
+                iteration_count = $2,
+                status = $3,
+                last_processed_comment = $4,
+                last_processed_comment_at = $5,
+                updated_at = NOW()
+            WHERE task_id = $6
             """,
             json.dumps(history, ensure_ascii=False),
             iteration_count,
+            status,
+            last_processed_comment,
+            last_processed_comment_at,
+            task_id,
+        )
+
+
+async def update_status(task_id: int, status: str) -> None:
+    async with _pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE task_dialogs
+            SET status = $1, updated_at = NOW()
+            WHERE task_id = $2
+            """,
             status,
             task_id,
         )
